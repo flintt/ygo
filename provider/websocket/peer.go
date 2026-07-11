@@ -244,7 +244,16 @@ func (p *peer) handleBinarySyncMessage(msg []byte) (reply []byte, applied bool, 
 		}
 		return encodeSyncStep2Msg(update), false, nil
 
-	case ygsync.MsgSyncStep2, ygsync.MsgUpdate:
+	case ygsync.MsgSyncStep2:
+		p.room.mu.Lock()
+		hasHead := len(p.room.binaryHead) > 0
+		p.room.mu.Unlock()
+		if hasHead {
+			return nil, false, nil
+		}
+		fallthrough
+
+	case ygsync.MsgUpdate:
 		p.room.mu.Lock()
 		if len(payload) > 0 {
 			if len(p.room.binaryHead) == 0 {
