@@ -158,7 +158,7 @@ func (m *MemoryPersistence) AppendUpdate(ctx context.Context, room string, updat
 		return 0, err
 	}
 	// Validate the update is well-formed V1 before committing a version.
-	if err := crdt.ApplyUpdateV1(crdt.New(), update, nil); err != nil {
+	if _, err := crdt.MergeUpdatesV1(update); err != nil {
 		return 0, err
 	}
 

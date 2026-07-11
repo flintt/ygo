@@ -42,6 +42,10 @@ type Transaction struct {
 	// TransactContext. Exposed via the Ctx() method so fn can poll for
 	// cancellation.
 	ctx context.Context
+	// yataMarkSeq issues temporary membership markers for Item.integrate's
+	// YATA conflict scanner. The markers are transaction-local and are never
+	// encoded or observed outside the apply/local-edit path.
+	yataMarkSeq uint64
 }
 
 // Ctx returns the context associated with this transaction. Transactions
@@ -54,6 +58,15 @@ type Transaction struct {
 // and reconcile via sync or recreate the doc from persistence.
 func (t *Transaction) Ctx() context.Context {
 	return t.ctx
+}
+
+func (t *Transaction) nextYATAMark() uint64 {
+	t.yataMarkSeq++
+	if t.yataMarkSeq == 0 {
+		// Practically unreachable, but keep zero reserved for "not marked".
+		t.yataMarkSeq = 1
+	}
+	return t.yataMarkSeq
 }
 
 // squashRuns merges adjacent ContentString items that were both created in this

@@ -242,18 +242,19 @@ func encodeFromSnapshotLocked(doc *Doc, snap *Snapshot) []byte {
 func gcTxnDeleteSet(doc *Doc, txn *Transaction) {
 	for client, ranges := range txn.deleteSet.clients {
 		items := doc.store.clients[client]
-		if len(items) == 0 {
+		if len(items) == 0 || len(ranges) == 0 {
 			continue
 		}
+		itemIdx := 0
 		for _, r := range ranges {
 			rangeEnd := r.Clock + r.Len
-			// Skip past items whose end is before the range start.
-			for _, item := range items {
+			for itemIdx < len(items) && items[itemIdx].ID.Clock+uint64(items[itemIdx].Content.Len()) <= r.Clock {
+				itemIdx++
+			}
+			for i := itemIdx; i < len(items); i++ {
+				item := items[i]
 				if item.ID.Clock >= rangeEnd {
 					break
-				}
-				if item.ID.Clock+uint64(item.Content.Len()) <= r.Clock {
-					continue
 				}
 				if !item.Deleted {
 					continue // shouldn't happen for items in deleteSet, but defensive

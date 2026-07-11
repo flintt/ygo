@@ -204,6 +204,14 @@ type room struct {
 	doc       *crdt.Doc
 	awareness *awareness.Awareness
 	peers     map[*peer]struct{}
+	// binaryMode keeps room state as a merged Yjs V1 update instead of
+	// materialising it into crdt.Doc on every load/update. It is intended for
+	// relay-style servers that only need sync/diff/broadcast semantics; those
+	// operations can be served directly from binary updates and avoid the
+	// expensive YATA integration path for large map-heavy documents.
+	binaryMode         bool
+	binaryHead         []byte
+	binaryMaterialized bool
 
 	// peerSem enforces MaxPeersPerRoom as a hard cap. Initialised at room
 	// creation time. nil when MaxPeersPerRoom == 0 (unlimited).
@@ -310,6 +318,13 @@ type Server struct {
 	// Upgrade requests that would exceed this limit are rejected with 503.
 	// Zero (the default) means unlimited (N-H5).
 	MaxPeersPerRoom int
+
+	// BinaryUpdateMode serves document sync from merged Yjs binary updates
+	// instead of eagerly materialising every room into crdt.Doc. This avoids
+	// high CPU on large map-heavy documents while preserving Yjs sync protocol
+	// semantics. Defaults to false for compatibility with callers that use
+	// GetDoc/OnLoadDocument as a live materialised CRDT document.
+	BinaryUpdateMode bool
 
 	// OnInject, if non-nil, is called before every server-side write
 	// (BroadcastUpdate or Apply). Return a non-nil error to refuse the
@@ -697,6 +712,17 @@ func (s *Server) GetDoc(name string) *crdt.Doc {
 	return nil
 }
 
+// IsBinaryRoom reports whether the named resident room is serving sync from a
+// binary update head rather than a materialised crdt.Doc.
+func (s *Server) IsBinaryRoom(name string) bool {
+	s.rmu.RLock()
+	defer s.rmu.RUnlock()
+	if r, ok := s.rooms[name]; ok {
+		return r.binaryMode
+	}
+	return false
+}
+
 // getOrCreateRoom returns the room for name, creating it on first use. When a
 // new room is created and a relay is attached, the relay's RoomActivated
 // callback fires AFTER s.rmu is released (#133): RoomActivated may synchronously
@@ -746,9 +772,10 @@ func (s *Server) getOrCreateRoomLocked(ctx context.Context, name string) (*room,
 		aw.StartAutoExpiry(s.AwarenessExpiry)
 	}
 	r := &room{
-		doc:       crdt.New(docOpts...),
-		awareness: aw,
-		peers:     make(map[*peer]struct{}),
+		doc:        crdt.New(docOpts...),
+		awareness:  aw,
+		peers:      make(map[*peer]struct{}),
+		binaryMode: s.BinaryUpdateMode,
 	}
 	if s.MaxPeersPerRoom > 0 {
 		r.peerSem = semaphore.NewWeighted(int64(s.MaxPeersPerRoom))
@@ -759,8 +786,12 @@ func (s *Server) getOrCreateRoomLocked(ctx context.Context, name string) (*room,
 			return nil, false, fmt.Errorf("loading room %q: %w", name, err)
 		}
 		if len(data) > 0 {
-			if err := crdt.ApplyUpdateV1(r.doc, data, nil); err != nil {
-				return nil, false, fmt.Errorf("bootstrapping room %q: %w", name, err)
+			if r.binaryMode {
+				r.binaryHead = append([]byte(nil), data...)
+			} else {
+				if err := crdt.ApplyUpdateV1(r.doc, data, nil); err != nil {
+					return nil, false, fmt.Errorf("bootstrapping room %q: %w", name, err)
+				}
 			}
 		}
 	}
@@ -788,12 +819,14 @@ func (s *Server) getOrCreateRoomLocked(ctx context.Context, name string) (*room,
 		r.persistStop = make(chan struct{})
 		r.persistDone = make(chan struct{})
 		s.startPersistenceWorker(r, name)
-		r.doc.OnUpdate(func(update []byte, _ any) {
-			select {
-			case r.persistCh <- update:
-			case <-r.persistStop:
-			}
-		})
+		if !r.binaryMode {
+			r.doc.OnUpdate(func(update []byte, _ any) {
+				select {
+				case r.persistCh <- update:
+				case <-r.persistStop:
+				}
+			})
+		}
 	}
 	// Wire relay observers (doc.OnUpdate + awareness.OnChange) so local changes
 	// are published to other nodes. Registered under s.rmu.Lock before the room
@@ -955,11 +988,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 1. Send sync step-1 — request the peer's state vector.
-	p.sendSync(ygsync.EncodeSyncStep1(rm.doc))
+	// 1. In materialized mode, request the peer's state vector so both sides
+	// exchange missing updates. In binary relay mode, the frontend applies a
+	// server-authoritative room snapshot first; asking for the peer diff here
+	// can replay stale IndexedDB CRDT history back into persistence.
+	if !rm.binaryMode {
+		p.sendSync(encodeRoomSyncStep1(rm))
+	}
 
 	// 2. Send sync step-2 — give the peer everything the server already has.
-	fullUpdate := crdt.EncodeStateAsUpdateV1(rm.doc, nil)
+	fullUpdate := encodeRoomFullUpdate(rm)
 	step2 := encodeSyncStep2Msg(fullUpdate)
 	p.sendSync(step2)
 
@@ -1011,4 +1049,36 @@ func encodeSyncStep2Msg(update []byte) []byte {
 	enc.WriteVarUint(ygsync.MsgSyncStep2)
 	enc.WriteVarBytes(update)
 	return enc.Bytes()
+}
+
+func encodeRoomSyncStep1(rm *room) []byte {
+	if rm == nil || !rm.binaryMode {
+		return ygsync.EncodeSyncStep1(rm.doc)
+	}
+	rm.mu.Lock()
+	head := append([]byte(nil), rm.binaryHead...)
+	rm.mu.Unlock()
+
+	var sv []byte
+	if len(head) > 0 {
+		if encoded, err := crdt.EncodeStateVectorFromUpdate(head); err == nil {
+			sv = encoded
+		}
+	}
+	if len(sv) == 0 {
+		sv = crdt.EncodeStateVectorV1(crdt.New())
+	}
+	enc := encoding.NewEncoder()
+	enc.WriteVarUint(ygsync.MsgSyncStep1)
+	enc.WriteVarBytes(sv)
+	return enc.Bytes()
+}
+
+func encodeRoomFullUpdate(rm *room) []byte {
+	if rm == nil || !rm.binaryMode {
+		return crdt.EncodeStateAsUpdateV1(rm.doc, nil)
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	return append([]byte(nil), rm.binaryHead...)
 }

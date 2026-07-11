@@ -55,7 +55,7 @@ func (s *Store) AppendUpdate(ctx context.Context, room string, update []byte) (p
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := crdt.ApplyUpdateV1(crdt.New(), update, nil); err != nil {
+	if _, err := crdt.MergeUpdatesV1(update); err != nil {
 		return 0, err
 	}
 	s.mu.Lock()

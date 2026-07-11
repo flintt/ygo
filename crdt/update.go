@@ -615,6 +615,7 @@ func decodeAndPark(txn *Transaction, dec *encoding.Decoder, sv StateVector, numC
 			// (Local inserts set item.Left directly; remote items only have Origin.)
 			if offset == 0 && item.Origin != nil {
 				item.Left = txn.doc.store.getItemCleanEnd(txn, item.Origin.Client, item.Origin.Clock)
+				item.originItem = item.Left
 			}
 
 			item.integrate(txn, offset)
@@ -1348,6 +1349,7 @@ func tryIntegrate(txn *Transaction, item *Item) bool {
 	// Resolve left neighbor for integrate().
 	if item.Origin != nil {
 		item.Left = store.getItemCleanEnd(txn, item.Origin.Client, item.Origin.Clock)
+		item.originItem = item.Left
 	}
 
 	item.integrate(txn, 0)

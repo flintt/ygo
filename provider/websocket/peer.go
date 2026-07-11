@@ -9,6 +9,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/reearth/ygo/awareness"
+	"github.com/reearth/ygo/crdt"
 	"github.com/reearth/ygo/encoding"
 	ygsync "github.com/reearth/ygo/sync"
 )
@@ -62,6 +63,20 @@ func (p *peer) handleMessage(data []byte) {
 				return
 			}
 		}
+		if p.room.binaryMode {
+			reply, applied, err := p.handleBinarySyncMessage(payload)
+			if err != nil {
+				p.server.log().Debug("discarded unappliable binary sync message",
+					"room", p.roomName, "err", err)
+				return
+			}
+			if reply != nil {
+				p.sendSync(reply)
+			} else if applied {
+				p.broadcastSync(payload)
+			}
+			return
+		}
 		reply, err := ygsync.ApplySyncMessage(p.room.doc, payload, p)
 		if err != nil {
 			p.server.log().Debug("discarded unappliable sync message",
@@ -114,6 +129,16 @@ func (p *peer) handleMessage(data []byte) {
 			return // #59: SyncReply carries a SyncStep2 write; drop it for read-only peers.
 		}
 		payload := dec.RemainingBytes()
+		if p.room.binaryMode {
+			if _, applied, err := p.handleBinarySyncMessage(payload); err != nil {
+				p.server.log().Debug("discarded unappliable binary sync(reply) message",
+					"room", p.roomName, "err", err)
+				return
+			} else if applied {
+				p.broadcastSync(payload)
+			}
+			return
+		}
 		if _, err := ygsync.ApplySyncMessage(p.room.doc, payload, p); err != nil {
 			p.server.log().Debug("discarded unappliable sync(reply) message",
 				"room", p.roomName, "err", err)
@@ -192,6 +217,66 @@ func (p *peer) handleMessage(data []byte) {
 		// Hocuspocus tag 10 (#55). Reply to a server-sent Ping. ygo does
 		// not currently send Pings, so this is a no-op pass-through that
 		// just keeps the dispatcher from dropping the frame.
+	}
+}
+
+func (p *peer) handleBinarySyncMessage(msg []byte) (reply []byte, applied bool, err error) {
+	msgType, payload, err := ygsync.ReadSyncMessage(msg)
+	if err != nil {
+		return nil, false, err
+	}
+
+	switch msgType {
+	case ygsync.MsgSyncStep1:
+		sv, err := crdt.DecodeStateVectorV1(payload)
+		if err != nil {
+			return nil, false, err
+		}
+		p.room.mu.Lock()
+		head := append([]byte(nil), p.room.binaryHead...)
+		p.room.mu.Unlock()
+		var update []byte
+		if len(head) > 0 {
+			update, err = crdt.DiffUpdateV1(head, sv)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+		return encodeSyncStep2Msg(update), false, nil
+
+	case ygsync.MsgSyncStep2, ygsync.MsgUpdate:
+		p.room.mu.Lock()
+		if len(payload) > 0 {
+			if len(p.room.binaryHead) == 0 {
+				p.room.binaryHead = append([]byte(nil), payload...)
+			} else {
+				if svBytes, e := crdt.EncodeStateVectorFromUpdate(p.room.binaryHead); e == nil {
+					if sv, e := crdt.DecodeStateVectorV1(svBytes); e == nil {
+						if missing, e := crdt.DiffUpdateV1(payload, sv); e == nil && len(missing) <= 2 {
+							p.room.mu.Unlock()
+							return nil, false, nil
+						}
+					}
+				}
+				merged, err := crdt.MergeUpdatesV1(p.room.binaryHead, payload)
+				if err != nil {
+					p.room.mu.Unlock()
+					return nil, false, err
+				}
+				p.room.binaryHead = merged
+			}
+		}
+		p.room.mu.Unlock()
+		if len(payload) > 0 && p.room.persistCh != nil {
+			select {
+			case p.room.persistCh <- payload:
+			case <-p.room.persistStop:
+			}
+		}
+		return nil, len(payload) > 0, nil
+
+	default:
+		return nil, false, ygsync.ErrUnknownMessage
 	}
 }
 

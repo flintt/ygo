@@ -291,6 +291,9 @@ func (s *Server) Apply(
 	if err != nil {
 		return err
 	}
+	if err := materializeBinaryRoom(rm); err != nil {
+		return err
+	}
 
 	origin := new(struct{})
 	var (
@@ -394,6 +397,17 @@ func (s *Server) Apply(
 	if len(merged) > s.effectiveMaxUpdateBytes() {
 		return ErrUpdateTooLarge
 	}
+	if rm.binaryMode {
+		if err := mergeRoomBinaryHead(rm, merged); err != nil {
+			return err
+		}
+		if rm.persistCh != nil {
+			select {
+			case rm.persistCh <- merged:
+			case <-rm.persistStop:
+			}
+		}
+	}
 
 	rm.mu.Lock()
 	targets := make([]*peer, 0, len(rm.peers))
@@ -406,6 +420,45 @@ func (s *Server) Apply(
 	for _, p := range targets {
 		p.write(data)
 	}
+	return nil
+}
+
+func materializeBinaryRoom(rm *room) error {
+	if rm == nil || !rm.binaryMode {
+		return nil
+	}
+	rm.mu.Lock()
+	if rm.binaryMaterialized || len(rm.binaryHead) == 0 {
+		rm.binaryMaterialized = true
+		rm.mu.Unlock()
+		return nil
+	}
+	head := append([]byte(nil), rm.binaryHead...)
+	rm.mu.Unlock()
+	if err := crdt.ApplyUpdateV1(rm.doc, head, nil); err != nil {
+		return err
+	}
+	rm.mu.Lock()
+	rm.binaryMaterialized = true
+	rm.mu.Unlock()
+	return nil
+}
+
+func mergeRoomBinaryHead(rm *room, update []byte) error {
+	if rm == nil || !rm.binaryMode || len(update) == 0 {
+		return nil
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if len(rm.binaryHead) == 0 {
+		rm.binaryHead = append([]byte(nil), update...)
+		return nil
+	}
+	merged, err := crdt.MergeUpdatesV1(rm.binaryHead, update)
+	if err != nil {
+		return err
+	}
+	rm.binaryHead = merged
 	return nil
 }
 

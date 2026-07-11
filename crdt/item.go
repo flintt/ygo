@@ -40,6 +40,17 @@ type Item struct {
 	// re-insertion to avoid redoing the same item twice and to let neighbour
 	// position-tracing follow the chain. Never encoded. (Yjs Item.redone parity.)
 	redone *ID
+	// Transient membership marks used by the YATA conflict scanner. The scanner
+	// needs two temporary sets per integrate call; storing transaction-scoped
+	// marker IDs on Items avoids allocating and growing large maps while loading
+	// heavily contended updates.
+	beforeOriginMark uint64
+	conflictingMark  uint64
+	// originItem caches the Item referenced by Origin. Origin is immutable after
+	// integration, and the conflict scanner repeatedly resolves scanned items'
+	// origins. Caching removes repeated StructStore binary searches in large
+	// same-parent conflict runs.
+	originItem *Item
 }
 
 // parentSubKey collapses a *string parentSub to a plain string bucket label for
@@ -86,6 +97,7 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 		if item.Left != nil {
 			last := item.Left.ID.Clock + uint64(item.Left.Content.Len()) - 1
 			item.Origin = &ID{Client: item.Left.ID.Client, Clock: last}
+			item.originItem = item.Left
 		}
 		item.Content = item.Content.Splice(offset)
 	}
@@ -107,6 +119,9 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 
 	// Determine the starting scan position: immediately right of the left origin.
 	left := item.Left
+	if item.originItem == nil && item.Origin != nil && itemContainsID(left, *item.Origin) {
+		item.originItem = left
+	}
 	var o *Item
 	if left == nil {
 		o = item.Parent.start
@@ -114,36 +129,45 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 		o = left.Right
 	}
 
+	skipConflictScan := false
+	if item.ParentSub != nil && item.Parent.itemMap != nil {
+		if _, exists := item.Parent.itemMap[*item.ParentSub]; !exists {
+			// Cross-key YMap/YXml-attribute order is not user-visible. For a key
+			// that has never existed in this parent, there is no same-key winner to
+			// compare against, so the full YATA conflict scan cannot affect the map
+			// value. Skipping it prevents large documents with many distinct keys
+			// from paying sequence-insert costs for map population.
+			skipConflictScan = true
+		}
+	}
+
 	// Fast path: no conflict scanning needed when there are no items between
 	// the left origin and the right origin. This is the common case for local
 	// inserts at the end of a run and for remote items decoded in clock order.
-	if o != nil && o != item.Right {
+	if !skipConflictScan && o != nil && o != item.Right {
 		// Slow path: conflicting is the set of items in the current conflict
 		// group (items with the same left origin as us that we are comparing
 		// against). beforeOrigin tracks every item we have scanned past, so we
 		// can detect whether a later item's origin lies inside the conflict zone.
 		//
-		// Both maps are allocated here rather than unconditionally so that the
-		// common (no-conflict) case pays zero allocation cost.
-		conflicting := make(map[*Item]struct{})
-		beforeOrigin := make(map[*Item]struct{})
+		// Use transaction-scoped Item marks instead of temporary maps. Some
+		// real-world updates contain tens of thousands of same-parent conflicts;
+		// allocating and repeatedly clearing maps in this loop makes ApplyUpdate
+		// spend seconds in hash-map growth.
+		beforeMark := txn.nextYATAMark()
+		conflictMark := txn.nextYATAMark()
 
 		// Scan right until we hit our right origin (item.Right) or the end.
 		for o != nil && o != item.Right {
-			beforeOrigin[o] = struct{}{}
-			conflicting[o] = struct{}{}
+			o.beforeOriginMark = beforeMark
+			o.conflictingMark = conflictMark
 
 			if originIDEquals(item.Origin, o.Origin) {
 				// Case 1: o has the same left origin as us — concurrent insert at
 				// the same position. Lower ClientID wins (placed to the left).
 				if o.ID.Client < item.ID.Client {
 					left = o
-					// Reuse the map instead of reallocating (Yjs does
-					// conflictingItems.clear() here). Under high same-position
-					// contention this fires O(group size) times per integrate, so
-					// a fresh make() each time made conflict-scan allocation
-					// quadratic in the conflict-group size (#54-C).
-					clear(conflicting)
+					conflictMark = txn.nextYATAMark()
 				} else if originIDEquals(item.OriginRight, o.OriginRight) {
 					// Same left and right origin — truly symmetric; stop.
 					break
@@ -152,14 +176,18 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 				// Case 2: o has a different left origin. Check whether that
 				// origin lies before the conflict zone (beforeOrigin) or within
 				// it (conflicting). If inside, o belongs after us — skip it.
-				oOriginItem := txn.doc.store.Find(*o.Origin)
+				oOriginItem := o.originItem
+				if !itemContainsID(oOriginItem, *o.Origin) {
+					oOriginItem = txn.doc.store.Find(*o.Origin)
+					o.originItem = oOriginItem
+				}
 				if oOriginItem == nil {
 					break
 				}
-				if _, inBefore := beforeOrigin[oOriginItem]; inBefore {
-					if _, inConflict := conflicting[oOriginItem]; !inConflict {
+				if oOriginItem.beforeOriginMark == beforeMark {
+					if oOriginItem.conflictingMark != conflictMark {
 						left = o
-						clear(conflicting) // reuse the map, not realloc (see above / Yjs parity)
+						conflictMark = txn.nextYATAMark()
 					}
 				} else {
 					break
@@ -187,6 +215,9 @@ func (item *Item) integrate(txn *Transaction, offset int) {
 	// Back-pointer: if our right neighbour exists, point it back to us.
 	if item.Right != nil {
 		item.Right.Left = item
+	}
+	if item.Origin != nil && item.originItem == nil {
+		item.originItem = item.Left
 	}
 
 	// Update logical length and, if necessary, invalidate the position cache.
@@ -386,6 +417,7 @@ func splitItem(txn *Transaction, item *Item, offset int) *Item {
 		ParentSub:   item.ParentSub,
 		Content:     rightContent,
 		Deleted:     item.Deleted,
+		originItem:  item,
 	}
 	if right.Right != nil {
 		right.Right.Left = right
@@ -414,6 +446,16 @@ func originIDEquals(a, b *ID) bool {
 		return false
 	}
 	return a.Client == b.Client && a.Clock == b.Clock
+}
+
+func itemContainsID(item *Item, id ID) bool {
+	if item == nil {
+		return false
+	}
+	if item.ID.Client != id.Client || item.ID.Clock > id.Clock {
+		return false
+	}
+	return item.ID.Clock+uint64(item.Content.Len()) > id.Clock
 }
 
 // resolveMovedItem finds the item at targetID and ensures it covers exactly
