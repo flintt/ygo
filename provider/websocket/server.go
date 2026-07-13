@@ -237,6 +237,12 @@ type ConnectionConfig struct {
 	// awareness broadcasts but its inbound writes are dropped server-side. See
 	// Server.Authorize for the exact semantics.
 	ReadOnly bool
+
+	// InitialStatelessPayloads are sent to the peer as Hocuspocus Stateless
+	// (tag 5) frames immediately after the WebSocket writer starts and before
+	// the normal sync handshake. They are useful for server-originated metadata
+	// such as version/config hints. Empty by default.
+	InitialStatelessPayloads []string
 }
 
 // Server is a net/http-compatible WebSocket handler.
@@ -847,6 +853,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Authorize (issue #59) takes precedence over AuthFunc when both are set: it
 	// both accepts/rejects and reports per-connection config (read-only). AuthFunc
 	// grants read-write. Rejecting either way is a 401 before the upgrade.
+	var connCfg ConnectionConfig
 	var readOnly bool
 	switch {
 	case s.Authorize != nil:
@@ -855,6 +862,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		connCfg = cfg
 		readOnly = cfg.ReadOnly
 	case s.AuthFunc != nil:
 		if !s.AuthFunc(r) {
@@ -967,6 +975,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// runWriter teardown via close(writeCh) + <-writerDone. Before this
 	// point, a TOCTOU loss returned without cleanup, leaking runWriter (#33).
 	go p.runWriter()
+
+	for _, payload := range connCfg.InitialStatelessPayloads {
+		p.sendStateless(payload)
+	}
 
 	defer func() {
 		close(p.done) // H1: unblock the context-watcher goroutine

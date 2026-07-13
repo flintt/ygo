@@ -482,6 +482,15 @@ func (p *peer) sendAwareness(awMsg []byte) {
 	}))
 }
 
+// sendStateless writes a Hocuspocus Stateless message (outer type 5, VarString
+// payload) to this peer.
+func (p *peer) sendStateless(payload string) {
+	p.write(encoding.EncodeBytes(func(enc *encoding.Encoder) {
+		enc.WriteVarUint(msgStateless)
+		enc.WriteVarString(payload)
+	}))
+}
+
 // broadcastSync sends a sync message to all OTHER peers in the room.
 func (p *peer) broadcastSync(syncMsg []byte) {
 	p.broadcast(encoding.EncodeBytes(func(enc *encoding.Encoder) {

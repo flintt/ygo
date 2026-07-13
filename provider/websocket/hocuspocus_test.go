@@ -1,6 +1,7 @@
 package websocket_test
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -139,6 +140,31 @@ func TestInteg_Hocuspocus_Stateless_FiresHookNoBroadcast(t *testing.T) {
 	_, _, err := connB.ReadMessage()
 	require.Error(t, err, "Stateless (tag 5) must NOT broadcast to other peers")
 	_ = connB.SetReadDeadline(time.Time{})
+}
+
+// InitialStatelessPayloads are server-originated metadata frames sent before
+// the standard sync handshake.
+func TestInteg_Hocuspocus_InitialStatelessPayload_SentOnConnect(t *testing.T) {
+	srv := ygws.NewServer()
+	srv.Authorize = func(*http.Request) (ygws.ConnectionConfig, bool) {
+		return ygws.ConnectionConfig{
+			InitialStatelessPayloads: []string{`{"type":"netopo.version","version":"test"}`},
+		}, true
+	}
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	conn := dial(t, ts, "initialstatelessroom")
+
+	outerType, payload := readOne(t, conn, 2*time.Second)
+	require.Equal(t, uint64(5), outerType, "first message should be Stateless")
+	dec := encoding.NewDecoder(payload)
+	got, err := dec.ReadVarString()
+	require.NoError(t, err)
+	assert.Equal(t, `{"type":"netopo.version","version":"test"}`, got)
+
+	drainHandshake(t, conn, crdt.New())
 }
 
 // #55 — BroadcastStateless (tag 6) must fan out to other peers as a
